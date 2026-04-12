@@ -35,7 +35,7 @@ logger = logging.getLogger("M7-repaware")
 # ---------------- Config ----------------
 @dataclass
 class M7QwenConfig:
-    model_dir: str = "meta-llama/Meta-Llama-3-8B"
+    model_dir: str = "outputs/model"
     capsules_dir: str = "outputs/capsules"
     interactions_log: str = "outputs/sentinel/interactions.jsonl"
     out_dir: Path = Path("outputs/global_adapters")
