@@ -53,11 +53,12 @@ logger = logging.getLogger("E-final")
 @dataclass
 class EConfig:
     # IO
-    model_dir: str = "meta-llama/Meta-Llama-3-8B"
-    capsules_dir: str = "outputs/capsules"
+    model_dir: str = "outputs/model"
     dataset_dir: str = "outputs/datasets"
-    remap_json: Optional[str] = "outputs/capsules/capsule_module_remap.json"
+    capsules_dir: str = "outputs/capsules_subject_span_mlpblock"
+    remap_json: Optional[str] = None
     out_dir: Path = Path("outputs/sentinel")
+
 
     # Router
     semantic_threshold: float = 0.68
@@ -371,9 +372,12 @@ class RuntimeCapsule:
             v = np.array(data["adapter_state_dict"]["suppression_direction"],
                          dtype=np.float32).flatten()
             if v.size > 0: self._raw_dirs.append(v)
-        if "signature_vector" in data:
-            v = np.array(data["signature_vector"], dtype=np.float32).flatten()
-            if v.size > 0: self._raw_dirs.append(v)
+        for key in ("signature_vector_raw", "signature_vector"):
+            if key in data and data[key] is not None:
+                v = np.array(data[key], dtype=np.float32).flatten()
+                if v.size > 0:
+                    self._raw_dirs.append(v)
+                    break
         if not self._raw_dirs:
             raise ValueError(f"No direction in capsule for {self.subject}")
         s = None
@@ -388,13 +392,13 @@ class RuntimeCapsule:
         self.base_strength = s if np.isfinite(s) else default_strength
 
     def _resize(self, vec: np.ndarray, H: int) -> torch.Tensor:
-        v = torch.tensor(vec, dtype=torch.float32); n = v.numel()
-        if n == H: out = v
-        elif n > H:
-            out = (v.view(n // H, H).mean(dim=0) if n % H == 0 else v[:H])
-        else:
-            out = torch.zeros(H, dtype=torch.float32); out[:n] = v
-        return out / (out.norm() + 1e-8)
+        v = torch.tensor(vec, dtype=torch.float32)
+        if v.numel() != H:
+            raise ValueError(
+                f"Signature dim {v.numel()} != hooked hidden dim {H} "
+                f"for subject={self.subject}, module={self.target_module_name}"
+            )
+        return v / (v.norm() + 1e-8)
 
     def _orthonorm(self, Ds: List[torch.Tensor]) -> List[torch.Tensor]:
         ortho = []
@@ -583,6 +587,31 @@ class Sentinel:
                 except Exception: pass
             cap.hook_handle = None; cap.is_active = False
         self._armed = []
+        
+    def _projection_score_on_capsule_module(self, prompt: str, cap: RuntimeCapsule) -> Optional[float]:
+        mod = self.named_mods.get(cap.target_module_name)
+        if mod is None:
+            return None
+
+        box = {}
+
+        def hook(module, inp, out):
+            hs = out[0] if isinstance(out, tuple) else out
+            h32 = hs.detach().to(torch.float32)
+            H = h32.shape[-1]
+            d0 = cap.prepare_dirs(H, h32.device)[0]
+            proj = torch.tensordot(h32, d0, dims=([-1], [0]))
+            box["score"] = float(torch.mean(torch.abs(proj)).item())
+
+        handle = mod.register_forward_hook(hook)
+        try:
+            inputs = self.tok(prompt, return_tensors="pt").to(self.cfg.device)
+            with torch.no_grad():
+                _ = self.model(**inputs, output_hidden_states=False)
+        finally:
+            handle.remove()
+
+        return box.get("score")
 
     def calibrate_z(self, prompts: List[str]):
         logger.info("[Calibrate] Subject-targeted calibration")
@@ -592,14 +621,8 @@ class Sentinel:
             for s in cand:
                 cap = self.capsules.get(s)
                 if not cap: continue
-                inputs = self.tok(p, return_tensors="pt").to(self.cfg.device)
-                with torch.no_grad():
-                    out = self.model(**inputs, output_hidden_states=True)
-                    hs = out.hidden_states[-1].detach().to(torch.float32)
-                    H = hs.shape[-1]
-                    d0 = cap.prepare_dirs(H, hs.device)[0]
-                    proj = torch.tensordot(hs, d0, dims=([-1], [0]))
-                    pm = float(torch.mean(torch.abs(proj)).item())
+                pm = self._projection_score_on_capsule_module(p, cap)
+                if pm is not None:
                     samples[s].append(pm)
         for s, vals in samples.items():
             if vals:
