@@ -36,7 +36,7 @@ logger = logging.getLogger("M7-repaware")
 @dataclass
 class M7QwenConfig:
     model_dir: str = "outputs/model"
-    capsules_dir: str = "outputs/capsules"
+    capsules_dir: str = "outputs/capsules_subject_span_mlpblock"
     interactions_log: str = "outputs/sentinel/interactions.jsonl"
     out_dir: Path = Path("outputs/global_adapters")
     adapter_name_prefix: str = "unlearning_adapter_repaware"
@@ -134,52 +134,44 @@ def _attach_lora(model, cfg: M7QwenConfig):
     return get_peft_model(model, peft_cfg)
 
 
-# ---------------- Signature loading ----------------
-def _load_signatures(capsules_dir: str,
-                     device: str) -> Dict[str, torch.Tensor]:
-    """
-    Load per-subject unit-norm signature vectors from capsule pkl.gz files.
-    Module D stores the vector as 'signature_vector' at the top level.
-    Falls back to other known key names for robustness.
-    """
-    sigs = {}
+# ---------------- Capsules loading ----------------
+def _load_capsules(capsules_dir: str, device: str) -> Dict[str, Dict[str, Any]]:
+    capsules = {}
+
     for p in sorted(Path(capsules_dir).glob("*_capsule.pkl.gz")):
         try:
             with gzip.open(p, "rb") as f:
                 obj = pickle.load(f)
+
             subj = str(obj.get("subject", p.stem.replace("_capsule", "")))
+            target = obj.get("target_module_name")
 
-            vec = None
-            # Module D key order — signature_vector is the primary key
-            for key in ["signature_vector", "signature", "d"]:
-                if key in obj and obj[key] is not None:
-                    vec = obj[key]; break
-            # Older capsule versions stored direction inside adapter_state_dict
-            if vec is None:
-                asd = obj.get("adapter_state_dict", {})
-                for key in ["suppression_direction", "signature_vector",
-                            "signature", "d"]:
-                    if key in asd and asd[key] is not None:
-                        vec = asd[key]; break
-
-            if vec is None:
-                logger.warning(
-                    f"[Sig] No direction in {p.name}, keys={list(obj.keys())}")
+            if not target or not target.endswith(".mlp"):
+                logger.warning(f"[Capsule] Skipping {subj}: bad target={target}")
                 continue
 
-            if not isinstance(vec, torch.Tensor):
-                vec = torch.from_numpy(
-                    np.array(vec, dtype=np.float32).flatten())
-            vec = vec.float().flatten().to(device)
-            norm = vec.norm()
-            if norm > 1e-8:
-                vec = vec / norm
-            sigs[subj] = vec
-            logger.info(
-                f"[Sig] Loaded signature for '{subj}', dim={vec.shape[0]}")
+            vec = obj.get("signature_vector_raw") or obj.get("signature_vector")
+            if vec is None:
+                asd = obj.get("adapter_state_dict", {})
+                vec = asd.get("suppression_direction")
+
+            if vec is None:
+                logger.warning(f"[Capsule] No direction in {p.name}")
+                continue
+
+            vec = torch.from_numpy(np.array(vec, dtype=np.float32).flatten()).to(device)
+            vec = vec / (vec.norm() + 1e-8)
+
+            capsules[subj] = {
+                "signature": vec,
+                "target_module_name": target,
+                "target_layer": obj.get("target_layer"),
+            }
+
         except Exception as e:
-            logger.warning(f"[Sig] Failed to load {p}: {e}")
-    return sigs
+            logger.warning(f"[Capsule] Failed to load {p}: {e}")
+
+    return capsules
 
 
 # ---------------- Signature suppression hooks ----------------
@@ -214,8 +206,9 @@ class SignatureSuppressor:
             # Resize v to match hidden dim if needed
             d = h32.shape[-1]
             if v.shape[0] != d:
-                v = v[:d] if v.shape[0] > d else F.pad(v, (0, d - v.shape[0]))
-                v = v / (v.norm() + 1e-8)
+                raise ValueError(
+                    f"Signature dim {v.shape[0]} != hooked hidden dim {d}"
+                )
 
             # h_par = (v · h) * v  broadcast over [B, T, d]
             proj = (h32 @ v).unsqueeze(-1) * v   # [B, T, d]
@@ -229,14 +222,34 @@ class SignatureSuppressor:
             return h_out
         return hook
 
-    def activate(self, sig: torch.Tensor):
+    def activate(self, sig: torch.Tensor, target_module_name: str):
         self._active_sig = sig
         self._hooks = []
-        for name, module in self.model.named_modules():
-            if "mlp" in name.lower() and not hasattr(module, "weight"):
-                if len(list(module.children())) > 0:
-                    h = module.register_forward_hook(self._make_hook())
-                    self._hooks.append(h)
+
+        named = dict(self.model.named_modules())
+        module = named.get(target_module_name)
+
+        if module is None:
+            suffix = "." + target_module_name
+            matches = [(n, m) for n, m in named.items() if n.endswith(suffix)]
+
+            if len(matches) == 1:
+                resolved_name, module = matches[0]
+                logger.info(
+                    f"Resolved PEFT-prefixed target module: "
+                    f"{target_module_name} -> {resolved_name}"
+                )
+            else:
+                raise ValueError(
+                    f"Target module not found or ambiguous: {target_module_name}; "
+                    f"matches={len(matches)}"
+                )
+
+        if not target_module_name.endswith(".mlp"):
+            raise ValueError(f"Expected outer MLP block, got {target_module_name}")
+
+        h = module.register_forward_hook(self._make_hook())
+        self._hooks.append(h)
 
     def deactivate(self):
         for h in self._hooks:
@@ -554,7 +567,7 @@ class RepAwareUPUTrainer:
         self.model.train()
         self.opt = optim.AdamW(self.model.parameters(), lr=cfg.lr)
 
-        self.signatures = _load_signatures(cfg.capsules_dir, cfg.device)
+        self.signatures = _load_capsules(cfg.capsules_dir, cfg.device)
         logger.info(f"[Sig] Loaded {len(self.signatures)} subject signatures")
 
         self.suppressor = SignatureSuppressor(
@@ -609,7 +622,11 @@ class RepAwareUPUTrainer:
                     # Activate suppression hooks for subject pairs so that
                     # DPO/UL/NT-UL operate on representation-suppressed states
                     if is_subject and subj and subj in self.signatures:
-                        self.suppressor.activate(self.signatures[subj])
+                        cap = self.signatures[subj]
+                        self.suppressor.activate(
+                            cap["signature"],
+                            cap["target_module_name"],
+                        )
 
                     # Student forward (hooks active for subject pairs)
                     logp_w, _, (stud_logits_w, ids_w, attn_w, resp_len_w) = \
