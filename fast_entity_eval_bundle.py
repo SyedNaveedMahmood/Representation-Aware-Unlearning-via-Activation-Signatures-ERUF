@@ -1,3 +1,5 @@
+#fast_entity_eval_bundle.py
+
 #!/usr/bin/env python3
 """
 Checkpointed fast entity evaluation bundle for KIF.

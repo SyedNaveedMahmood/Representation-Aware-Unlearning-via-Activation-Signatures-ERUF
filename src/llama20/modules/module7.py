@@ -1,3 +1,5 @@
+#src/llama20/modules/module7.py
+
 # === Module 7 — Representation-Aware UPU Loop (final) ===
 # - Loads capsule signature vectors (v) per subject from capsules_dir
 # - Registers forward hooks on MLP layers during loss computation that

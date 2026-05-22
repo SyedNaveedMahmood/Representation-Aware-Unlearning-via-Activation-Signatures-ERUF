@@ -1,3 +1,5 @@
+#src/llama20/modules/module8.py
+
 # === Module 8 — Clean Evaluation (+ EL10 + Cohen's d, PEFT-safe) ===
 # Evaluates utility & forgetting WITHOUT hooks (fair benchmarking).
 # Adds:

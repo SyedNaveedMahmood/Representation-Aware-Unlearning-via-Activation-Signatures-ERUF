@@ -1,3 +1,5 @@
+#src/llama20/modules/module_e.py
+
 # === Module E — Hyper-Sentinel (final, paper-consistent) ===
 #
 # Core behaviour:
