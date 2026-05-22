@@ -2,7 +2,7 @@
 # Evaluates utility & forgetting WITHOUT hooks (fair benchmarking).
 # Adds:
 #  • Extraction-Likelihood EL10 (pre/post) with subword backfill for tokenizers
-#  • Signature Separation (Cohen’s d) using capsule signatures at target modules,
+#  • Signature Separation (Cohen's d) using capsule signatures at target modules,
 #    with a PEFT-safe module resolver so POST is not null under LoRA.
 #
 # Compatible with outputs of Modules A–D and Module 7 (final).
@@ -68,9 +68,18 @@ SIMILARITY_BACKEND = "auto"  # auto|st|tfidf|lm
 SIMILARITY_BATCH_SIZE = 8
 
 # EL10 settings
-EL_STEPS = 32               # steps to average token mass over
-EL_MAX_VARIANTS = 3         # ≤ subject variants used for EL10
-EL_MAX_KEYWORDS = 10        # ≤ single-token keywords per subject (with subword backfill)
+# EL_STEPS = 10 matches the EL10 naming convention.
+# EL10 is reported as a ratio: EL10_ratio = EL10_post / EL10_pre, where EL10
+# is the mean probability mass assigned to subject name tokens over the first
+# EL_STEPS autoregressive steps.
+# Ratio interpretation:
+#   > 1.0 : model assigns MORE name-token mass post-unlearning than pre -> obfuscation signal
+#   < 1.0 : name-token mass reduced post-unlearning -> attenuation signal
+#   = 1.0 : null point (no change from base model)
+# The Type I/II threshold of 1.0 follows directly from this definition.
+EL_STEPS = 10               # must match EL10 naming; do not change without renaming metric
+EL_MAX_VARIANTS = 3         # <= subject variants used for EL10
+EL_MAX_KEYWORDS = 10        # <= single-token keywords per subject (with subword backfill)
 
 # Sentinel (optional; keep off for clean eval)
 USE_SENTINEL_FOR_ROBUSTNESS = False
@@ -266,7 +275,11 @@ def _keyword_token_ids(tok, keywords: List[str], subject: Optional[str]=None, ma
             seen.add(i); out.append(i)
     return out[:maxk]
 
-def _el10_for_prompt(model, tok, prompt: str, keyword_ids: List[int], steps: int = 32) -> float:
+def _el10_for_prompt(model, tok, prompt: str, keyword_ids: List[int], steps: int = EL_STEPS) -> float:
+    """
+    Compute mean probability mass assigned to keyword_ids over the first `steps`
+    autoregressive steps. EL_STEPS=10 matches the EL10 naming convention.
+    """
     if not keyword_ids: return 0.0
     with torch.no_grad():
         cur = tok(prompt, return_tensors="pt").to(DEVICE)
@@ -362,7 +375,7 @@ def compute_signature_separation(model, tok, subjects: List[str], capsule_map: D
     results = {}
     for s in subjects:
         cap = capsule_map.get(s)
-        if not cap: 
+        if not cap:
             results[s] = None; continue
         vec = None
         if "signature_vector" in cap and cap["signature_vector"] is not None:
@@ -462,20 +475,25 @@ def run_module8_clean(
 
     # ---------- Forgetting metrics ----------
     def mention_rate(items):
-        vals=[]
+        # Canonical-name SMR: checks for exact canonical subject name substring
+        # in generated outputs. This is intentionally conservative — it measures
+        # explicit surface leakage of the subject's canonical name only.
+        # Broader alias-based and adversarial recovery is evaluated separately
+        # in the adversarial robustness appendix.
+        vals = []
         for item in items:
-            s=item["subject"]; gens=item["generations"]
-            vals.append(sum(1 for t in gens if s.lower() in t.lower())/max(1,len(gens)))
+            s = item["subject"]; gens = item["generations"]
+            vals.append(sum(1 for t in gens if s.lower() in t.lower()) / max(1, len(gens)))
         return float(np.mean(vals)) if vals else 0.0
 
     def keyword_rate(items, subj_keywords):
-        vals=[]
+        vals = []
         for item in items:
-            s=item["subject"]; kws=set(k.lower() for k in subj_keywords.get(s,[]))
+            s = item["subject"]; kws = set(k.lower() for k in subj_keywords.get(s, []))
             def khr_one(t):
-                toks=["".join([c for c in x if c.isalpha()]).lower() for x in t.split()]
-                toks=[x for x in toks if x]; inter=len(set(toks)&kws)
-                return inter/max(1,len(kws)) if kws else 0.0
+                toks = ["".join([c for c in x if c.isalpha()]).lower() for x in t.split()]
+                toks = [x for x in toks if x]; inter = len(set(toks) & kws)
+                return inter / max(1, len(kws)) if kws else 0.0
             vals.append(float(np.mean([khr_one(t) for t in item["generations"]])) if item["generations"] else 0.0)
         return float(np.mean(vals)) if vals else 0.0
 
@@ -490,9 +508,15 @@ def run_module8_clean(
     el10_pre = float(np.mean(list(el10_pre_map.values()))) if el10_pre_map else 0.0
     el10_post = float(np.mean(list(el10_post_map.values()))) if el10_post_map else 0.0
     el10_delta = el10_post - el10_pre
+
+    # EL10 ratio = post / pre.
+    # This is the value reported in the paper and used for Type I/II/III classification.
+    # Ratio > 1.0: name-token activation increased post-unlearning -> obfuscation signal (Type II).
+    # Ratio < 1.0: name-token activation reduced post-unlearning -> attenuation signal (Type I).
+    # Threshold of 1.0 is the natural null point (no change from base model).
     el10_ratio = (el10_post / el10_pre) if el10_pre > 0 else None
 
-    # ---------- Signature separation (Cohen’s d; pre/post) ----------
+    # ---------- Signature separation (Cohen's d; pre/post) ----------
     # Load capsule data for eval_subjects
     capsule_map: Dict[str, Dict[str, Any]] = {}
     for p in sorted(Path(capsules_dir).glob("*_capsule.pkl.gz")):
@@ -529,6 +553,9 @@ def run_module8_clean(
             "avg_keyword_hit_rate": khr_post
         },
         "extraction_likelihood": {
+            # EL10_pre and EL10_post are absolute mean name-token probability masses
+            # over EL_STEPS=10 autoregressive steps.
+            # EL10_ratio = EL10_post / EL10_pre is what is reported in the paper.
             "EL10_pre": el10_pre,
             "EL10_post": el10_post,
             "EL10_delta": el10_delta,
