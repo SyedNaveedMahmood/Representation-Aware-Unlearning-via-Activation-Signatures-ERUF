@@ -247,33 +247,129 @@ def cosine_batch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=1)
 
 # ---------------- EL10 (Extraction-Likelihood) ----------------
-def _keyword_token_ids(tok, keywords: List[str], subject: Optional[str]=None, maxk: int = 10) -> List[int]:
-    ids = []
-    # 1) prefer single-token keywords from prompts.jsonl
-    for w in keywords or []:
-        try:
-            t = tok.encode(w, add_special_tokens=False)
-            if len(t) == 1:
-                ids.append(int(t[0]))
-        except Exception:
-            pass
-        if len(ids) >= maxk: break
-    # 2) backfill using subject subtokens (for models that split names heavily)
-    if len(ids) < 3 and subject:
-        try:
-            sub_ids = tok.encode(subject, add_special_tokens=False)
-            for i in sub_ids:
-                if i not in ids:
-                    ids.append(int(i))
-                    if len(ids) >= maxk: break
-        except Exception:
-            pass
-    # dedupe preserve order
+
+_DEFAULT_STOPWORDS: Set[str] = {
+    "about", "above", "after", "also", "another", "artist", "award",
+    "best", "birth", "born", "both", "career", "category", "children",
+    "confirm", "correct", "description", "different", "does", "each",
+    "from", "have", "here", "into", "just", "know", "like", "more",
+    "most", "much", "only", "other", "over", "same", "some", "such",
+    "than", "that", "their", "them", "then", "there", "these", "they",
+    "this", "through", "time", "under", "very", "well", "were", "what",
+    "when", "where", "which", "while", "with", "would", "year", "your",
+    "active", "actor", "accepted", "alternative", "american", "arts",
+    "album", "achievement", "nominated", "notable", "occupation",
+    "received", "singer", "rapper", "record",
+    "cast", "center", "child", "composer", "country",
+    "date", "dates", "details", "educated", "entity",
+    "friend", "full", "general", "genres", "give",
+    "heard", "information", "audio", "artists",
+    "association", "cash", "brit",
+    "label", "known", "later", "music", "name",
+    "named", "national", "note", "noted", "often", "part",
+    "place", "play", "played", "playing", "popular",
+    "previous", "prior", "produced", "release",
+    "released", "role", "show", "since", "song", "songs",
+    "stage", "start", "style", "title", "tour", "track",
+    "used", "work", "works", "world", "wrote",
+}
+
+
+def _is_degenerate_name_token(decoded: str) -> bool:
+    stripped = decoded.strip()
+    if len(stripped) <= 1:
+        return True
+    if stripped.lower() in {"ed", "er", "de", "le", "an", "on", "in", "re",
+                             "al", "el", "la", "da", "di", "il", "et"}:
+        return True
+    return False
+
+
+def _name_variants(subject: str) -> List[str]:
+    clean = re.sub(r"\s*\(.*?\)\s*", " ", subject).strip()
+    parts = clean.split()
+    candidates = []
+    for text in [clean] + parts:
+        candidates.append(text)
+        candidates.append(" " + text)
+        candidates.append(text.lower())
+        candidates.append(" " + text.lower())
     seen, out = set(), []
-    for i in ids:
-        if i not in seen:
-            seen.add(i); out.append(i)
-    return out[:maxk]
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _keyword_token_ids(tok, keywords: List[str], subject: Optional[str] = None,
+                       maxk: int = 10,
+                       stopwords: Optional[Set[str]] = None) -> List[int]:
+    if stopwords is None:
+        stopwords = _DEFAULT_STOPWORDS
+
+    seen: Set[int] = set()
+    ids: List[int] = []
+    resolved_name_ids: List[int] = []
+
+    # Pass 1: canonical name subtokens (always primary)
+    if subject:
+        for variant in _name_variants(subject):
+            if len(ids) >= maxk:
+                break
+            try:
+                enc = tok.encode(variant, add_special_tokens=False)
+                if len(enc) == 1:
+                    tid = int(enc[0])
+                    decoded = tok.decode([tid])
+                    if tid not in seen and not _is_degenerate_name_token(decoded):
+                        seen.add(tid)
+                        ids.append(tid)
+                        resolved_name_ids.append(tid)
+            except Exception:
+                pass
+
+        if not resolved_name_ids:
+            logger.warning(
+                "Subject '%s': no single-token name variant found; "
+                "falling back to full subtoken sequence.", subject
+            )
+            try:
+                sub_ids = tok.encode(subject, add_special_tokens=False)
+                for tid in sub_ids:
+                    if len(ids) >= maxk:
+                        break
+                    tid = int(tid)
+                    decoded = tok.decode([tid])
+                    if tid not in seen and not _is_degenerate_name_token(decoded):
+                        seen.add(tid)
+                        ids.append(tid)
+            except Exception:
+                pass
+
+    # Pass 2: subject-specific single-token keywords (stopword-filtered)
+    for w in keywords or []:
+        if len(ids) >= maxk:
+            break
+        if w.lower() in stopwords:
+            continue
+        try:
+            enc = tok.encode(w, add_special_tokens=False)
+            if len(enc) == 1:
+                tid = int(enc[0])
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+        except Exception:
+            pass
+
+    if not ids:
+        logger.warning(
+            "Subject '%s': zero token IDs resolved — EL10 will return 0.0.", subject
+        )
+
+    return ids[:maxk]
+
 
 def _el10_for_prompt(model, tok, prompt: str, keyword_ids: List[int], steps: int = EL_STEPS) -> float:
     """
