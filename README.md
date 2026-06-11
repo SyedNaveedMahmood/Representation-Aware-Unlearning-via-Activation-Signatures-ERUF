@@ -1,4 +1,4 @@
-# KIF Pipeline Runner
+# ERUF Pipeline Runner
 
 This repo runs the full pipeline sequentially from a single script, including the self-healing loop (Module 7 → Module 8) until forgetting thresholds hold.
 
