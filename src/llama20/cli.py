@@ -10,8 +10,9 @@ MODULES: Dict[str, tuple[str, str]] = {
     "module_b": ("llama20.modules.module_b", "run_module_b"),
     "module_c": ("llama20.modules.module_c", "run_module_c"),
     "module_d": ("llama20.modules.module_d", "run_module_d"),
-    "module_e": ("llama20.modules.module_e", "run_module_e_tight"),
-    "module7": ("llama20.modules.module7", "run_module7_qwen"),
+    # Keep CLI names stable while pointing to the current final implementations.
+    "module_e": ("llama20.modules.module_e", "run_module_e_final"),
+    "module7": ("llama20.modules.module7", "run_module7_repaware"),
     "module8": ("llama20.modules.module8", "run_module8_clean"),
     "loop": ("llama20.loop", "run_forget_loop"),
 }
