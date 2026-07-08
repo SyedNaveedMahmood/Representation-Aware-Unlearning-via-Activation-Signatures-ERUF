@@ -91,6 +91,48 @@ class ProbeConfig:
 # Utilities
 # -----------------------------------------------------------
 
+
+def _parse_layers(value: str | None, default: List[int]) -> List[int]:
+    """Parse comma/range layer specs such as "20-28" or "16,20-28,31"."""
+    if not value or not value.strip():
+        return list(default)
+    layers = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if hi < lo:
+                raise ValueError(f"Invalid descending layer range: {part}")
+            layers.update(range(lo, hi + 1))
+        else:
+            layers.add(int(part))
+    if not layers:
+        raise ValueError(f"No valid layers parsed from KIF_MODULE_B_LAYERS={value!r}")
+    return sorted(layers)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default)
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
 def get_primary_device(model: nn.Module) -> torch.device:
     try:
         return next(model.parameters()).device
@@ -395,18 +437,29 @@ class OptimizedProbeRobot:
 # -----------------------------------------------------------
 
 def run_module_b():
-    # You can tweak defaults here for your box
+    # Default remains full-depth capture, but local/cluster runs can override
+    # without editing source. Examples:
+    #   KIF_MODULE_B_LAYERS=20-28 llama20 module_b
+    #   KIF_MODULE_B_LAYERS=20,22,24-28 KIF_MODULE_B_BATCH_SIZE=8 llama20 module_b
+    default_layers = list(range(32))
     cfg = ProbeConfig(
-        layers=list(range(32)),      # adapt to model depth (e.g., Llama-2-7B has 32)
-        targets=["mlp"],
-        batch_size=32,               # try 16/32/64 based on VRAM
-        max_length=128,
-        use_half_precision=True,     # fp16 weights if supported
-        save_dtype_fp16=True,        # store activations as fp16
-        device_map="auto",
-        cleanup_every_batches=10,
-        compression_level=3,
-        capture_scope="full",       # or "last_token" to shrink storage massively
+        model_dir=os.environ.get("KIF_MODULE_B_MODEL_DIR", "outputs/model"),
+        prompts_file=os.environ.get("KIF_MODULE_B_PROMPTS_FILE", "outputs/datasets/prompts.jsonl"),
+        output_dir=Path(os.environ.get("KIF_MODULE_B_OUTPUT_DIR", "outputs/activations")),
+        layers=_parse_layers(os.environ.get("KIF_MODULE_B_LAYERS"), default_layers),
+        targets=_env_list("KIF_MODULE_B_TARGETS", ["mlp"]),
+        batch_size=_env_int("KIF_MODULE_B_BATCH_SIZE", 32),
+        max_length=_env_int("KIF_MODULE_B_MAX_LENGTH", 128),
+        use_half_precision=_env_bool("KIF_MODULE_B_USE_HALF_PRECISION", True),
+        save_dtype_fp16=_env_bool("KIF_MODULE_B_SAVE_DTYPE_FP16", True),
+        device_map=os.environ.get("KIF_MODULE_B_DEVICE_MAP", "auto"),
+        cleanup_every_batches=_env_int("KIF_MODULE_B_CLEANUP_EVERY_BATCHES", 10),
+        compression_level=_env_int("KIF_MODULE_B_COMPRESSION_LEVEL", 3),
+        capture_scope=os.environ.get("KIF_MODULE_B_CAPTURE_SCOPE", "full"),
+    )
+    logger.info(
+        "Module B config: layers=%s targets=%s batch_size=%s max_length=%s capture_scope=%s output_dir=%s",
+        cfg.layers, cfg.targets, cfg.batch_size, cfg.max_length, cfg.capture_scope, cfg.output_dir,
     )
 
     robot = OptimizedProbeRobot(cfg)
